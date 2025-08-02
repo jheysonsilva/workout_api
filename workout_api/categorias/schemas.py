@@ -1,13 +1,15 @@
 from typing import Annotated
-
-from pydantic import UUID4, Field
+from pydantic import Field
 from workout_api.contrib.schemas import BaseSchema
 
+class CategoriaBase(BaseSchema):
+    nome: Annotated[str, Field(description='Nome da categoria', example='Scale', max_length=50)]
 
-class CategoriaIn(BaseSchema):
-    nome: Annotated[str, Field(description='Nome da categoria', example='Scale', max_length=10)]
+class CategoriaIn(CategoriaBase):
+    pass
 
+class CategoriaOut(CategoriaBase):
+    pk_id: int
 
-class CategoriaOut(CategoriaIn):
-    id: Annotated[UUID4, Field(description='Identificador da categoria')]
-
+    class Config:
+        orm_mode = True

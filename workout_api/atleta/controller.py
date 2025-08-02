@@ -1,142 +1,224 @@
-from datetime import datetime
-from uuid import uuid4
-from fastapi import APIRouter, Body, HTTPException, status
-from pydantic import UUID4
+from typing import Optional
+from fastapi import APIRouter, Body, HTTPException, status, Query, Depends
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.future import select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy import func
+
+from fastapi_pagination import Page, Params, add_pagination
 
 from workout_api.atleta.schemas import AtletaIn, AtletaOut, AtletaUpdate
 from workout_api.atleta.models import AtletaModel
 from workout_api.categorias.models import CategoriaModel
 from workout_api.centro_treinamento.models import CentroTreinamentoModel
-
-from workout_api.contrib.dependencies import DatabaseDependency
-from sqlalchemy.future import select
+from workout_api.configs.database import get_session
 
 router = APIRouter()
 
+
 @router.post(
-    '/', 
+    '/',
     summary='Criar um novo atleta',
     status_code=status.HTTP_201_CREATED,
     response_model=AtletaOut
 )
-async def post(
-    db_session: DatabaseDependency, 
-    atleta_in: AtletaIn = Body(...)
+async def create_atleta(
+    atleta_in: AtletaIn = Body(...),
+    db_session: AsyncSession = Depends(get_session)
 ):
-    categoria_nome = atleta_in.categoria.nome
-    centro_treinamento_nome = atleta_in.centro_treinamento.nome
-
+    # Verificar existência de categoria
     categoria = (await db_session.execute(
-        select(CategoriaModel).filter_by(nome=categoria_nome))
+        select(CategoriaModel).filter_by(pk_id=atleta_in.categoria_id))
     ).scalars().first()
-    
     if not categoria:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, 
-            detail=f'A categoria {categoria_nome} não foi encontrada.'
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f'Categoria com id {atleta_in.categoria_id} não encontrada.'
         )
-    
-    centro_treinamento = (await db_session.execute(
-        select(CentroTreinamentoModel).filter_by(nome=centro_treinamento_nome))
-    ).scalars().first()
-    
-    if not centro_treinamento:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, 
-            detail=f'O centro de treinamento {centro_treinamento_nome} não foi encontrado.'
-        )
-    try:
-        atleta_out = AtletaOut(id=uuid4(), created_at=datetime.utcnow(), **atleta_in.model_dump())
-        atleta_model = AtletaModel(**atleta_out.model_dump(exclude={'categoria', 'centro_treinamento'}))
 
-        atleta_model.categoria_id = categoria.pk_id
-        atleta_model.centro_treinamento_id = centro_treinamento.pk_id
-        
+    # Verificar existência de centro de treinamento
+    centro = (await db_session.execute(
+        select(CentroTreinamentoModel).filter_by(pk_id=atleta_in.centro_treinamento_id))
+    ).scalars().first()
+    if not centro:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f'Centro de treinamento com id {atleta_in.centro_treinamento_id} não encontrado.'
+        )
+
+    try:
+        atleta_model = AtletaModel(**atleta_in.model_dump())
         db_session.add(atleta_model)
         await db_session.commit()
+        await db_session.refresh(atleta_model)
+    except IntegrityError as e:
+        await db_session.rollback()
+        if 'cpf' in str(e.orig).lower():
+            raise HTTPException(
+                status_code=303,
+                detail=f"Já existe um atleta cadastrado com o CPF: {atleta_in.cpf}"
+            )
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail='Erro ao inserir dados no banco'
+            )
     except Exception:
+        await db_session.rollback()
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, 
-            detail='Ocorreu um erro ao inserir os dados no banco'
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail='Erro ao inserir dados no banco'
         )
 
-    return atleta_out
+    return AtletaOut.from_orm(atleta_model)
 
 
 @router.get(
-    '/', 
-    summary='Consultar todos os Atletas',
-    status_code=status.HTTP_200_OK,
-    response_model=list[AtletaOut],
+    '/',
+    summary='Listar atletas com filtros e paginação',
+    response_model=Page[AtletaOut]
 )
-async def query(db_session: DatabaseDependency) -> list[AtletaOut]:
-    atletas: list[AtletaOut] = (await db_session.execute(select(AtletaModel))).scalars().all()
-    
-    return [AtletaOut.model_validate(atleta) for atleta in atletas]
+async def list_atletas(
+    nome: Optional[str] = Query(None, description='Filtrar por nome do atleta'),
+    cpf: Optional[str] = Query(None, description='Filtrar por CPF do atleta'),
+    params: Params = Depends(),
+    db_session: AsyncSession = Depends(get_session)
+):
+    query = select(AtletaModel)
+
+    if nome:
+        query = query.filter(AtletaModel.nome.ilike(f'%{nome}%'))
+
+    if cpf:
+        query = query.filter(AtletaModel.cpf == cpf)
+
+    total_result = await db_session.execute(
+        select(func.count()).select_from(query.subquery())
+    )
+    total_count = total_result.scalar_one()
+
+    offset = (params.page - 1) * params.size
+    result = await db_session.execute(query.offset(offset).limit(params.size))
+    items = result.scalars().all()
+
+    return Page.create(items=items, total=total_count, params=params)
 
 
 @router.get(
-    '/{id}', 
-    summary='Consulta um Atleta pelo id',
+    '/{pk_id}',
+    summary='Obter atleta pelo id',
     status_code=status.HTTP_200_OK,
-    response_model=AtletaOut,
+    response_model=AtletaOut
 )
-async def get(id: UUID4, db_session: DatabaseDependency) -> AtletaOut:
-    atleta: AtletaOut = (
-        await db_session.execute(select(AtletaModel).filter_by(id=id))
+async def get_atleta(
+    pk_id: int,
+    db_session: AsyncSession = Depends(get_session)
+):
+    atleta = (await db_session.execute(
+        select(AtletaModel).filter_by(pk_id=pk_id))
     ).scalars().first()
 
     if not atleta:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, 
-            detail=f'Atleta não encontrado no id: {id}'
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f'Atleta não encontrado para o id {pk_id}'
         )
-    
-    return atleta
+
+    return AtletaOut.from_orm(atleta)
 
 
 @router.patch(
-    '/{id}', 
-    summary='Editar um Atleta pelo id',
+    '/{pk_id}',
+    summary='Atualizar parcialmente atleta pelo id',
     status_code=status.HTTP_200_OK,
-    response_model=AtletaOut,
+    response_model=AtletaOut
 )
-async def patch(id: UUID4, db_session: DatabaseDependency, atleta_up: AtletaUpdate = Body(...)) -> AtletaOut:
-    atleta: AtletaOut = (
-        await db_session.execute(select(AtletaModel).filter_by(id=id))
+async def update_atleta(
+    pk_id: int,
+    atleta_up: AtletaUpdate = Body(...),
+    db_session: AsyncSession = Depends(get_session)
+):
+    atleta = (await db_session.execute(
+        select(AtletaModel).filter_by(pk_id=pk_id))
     ).scalars().first()
 
     if not atleta:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, 
-            detail=f'Atleta não encontrado no id: {id}'
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f'Atleta não encontrado para o id {pk_id}'
         )
-    
-    atleta_update = atleta_up.model_dump(exclude_unset=True)
-    for key, value in atleta_update.items():
-        setattr(atleta, key, value)
 
-    await db_session.commit()
-    await db_session.refresh(atleta)
+    dados_update = atleta_up.model_dump(exclude_unset=True)
 
-    return atleta
+    if 'categoria_id' in dados_update:
+        categoria = (await db_session.execute(
+            select(CategoriaModel).filter_by(pk_id=dados_update['categoria_id']))
+        ).scalars().first()
+        if not categoria:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f'Categoria com id {dados_update["categoria_id"]} não encontrada.'
+            )
+
+    if 'centro_treinamento_id' in dados_update:
+        centro = (await db_session.execute(
+            select(CentroTreinamentoModel).filter_by(pk_id=dados_update['centro_treinamento_id']))
+        ).scalars().first()
+        if not centro:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f'Centro de treinamento com id {dados_update["centro_treinamento_id"]} não encontrado.'
+            )
+
+    for chave, valor in dados_update.items():
+        setattr(atleta, chave, valor)
+
+    try:
+        await db_session.commit()
+        await db_session.refresh(atleta)
+    except IntegrityError as e:
+        await db_session.rollback()
+        if 'cpf' in str(e.orig).lower():
+            raise HTTPException(
+                status_code=303,
+                detail=f"Já existe um atleta cadastrado com o CPF: {dados_update.get('cpf')}"
+            )
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail='Erro ao atualizar dados no banco'
+            )
+    except Exception:
+        await db_session.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail='Erro ao atualizar dados no banco'
+        )
+
+    return AtletaOut.from_orm(atleta)
 
 
 @router.delete(
-    '/{id}', 
-    summary='Deletar um Atleta pelo id',
+    '/{pk_id}',
+    summary='Deletar atleta pelo id',
     status_code=status.HTTP_204_NO_CONTENT
 )
-async def delete(id: UUID4, db_session: DatabaseDependency) -> None:
-    atleta: AtletaOut = (
-        await db_session.execute(select(AtletaModel).filter_by(id=id))
+async def delete_atleta(
+    pk_id: int,
+    db_session: AsyncSession = Depends(get_session)
+):
+    atleta = (await db_session.execute(
+        select(AtletaModel).filter_by(pk_id=pk_id))
     ).scalars().first()
 
     if not atleta:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, 
-            detail=f'Atleta não encontrado no id: {id}'
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f'Atleta não encontrado para o id {pk_id}'
         )
-    
+
     await db_session.delete(atleta)
     await db_session.commit()
+
+
+add_pagination(router)
